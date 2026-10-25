@@ -26,9 +26,15 @@ jobs:
           -O apktool && chmod +x apktool
         wget -q "https://github.com/REAndroid/APKEditor/releases/download/V1.4.1/APKEditor-1.4.1.jar" \
           -O APKEditor.jar
-        wget -q "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar" \
-          -O signer.jar
         echo "Tools ready ✓"
+
+    - name: Find apksigner and zipalign from Android SDK
+      run: |
+        BUILD_TOOLS_ROOT="/usr/local/lib/android/sdk/build-tools"
+        LATEST=$(ls "$BUILD_TOOLS_ROOT" | sort -V | tail -1)
+        echo "Using build-tools: $LATEST"
+        echo "APKSIGNER=$BUILD_TOOLS_ROOT/$LATEST/apksigner" >> $GITHUB_ENV
+        echo "ZIPALIGN=$BUILD_TOOLS_ROOT/$LATEST/zipalign"   >> $GITHUB_ENV
 
     - name: Download APKS from release v1
       env:
@@ -146,7 +152,6 @@ jobs:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
 
-        # FIX: always inject .registers 1 so smali compiles clean
         STUB_FALSE = "    .registers 1\n    const/4 v0, 0x0\n    return v0\n"
         STUB_TRUE  = "    .registers 1\n    const/4 v0, 0x1\n    return v0\n"
 
@@ -167,8 +172,6 @@ jobs:
             is_ad = any(p.lower() in path.lower() for p in AD_PROVIDERS)
             if not is_ad:
                 continue
-
-            # FIX: don't capture .registers in group 1 — always replace it
             new_content = re.sub(
                 r'(\.method public onCreate\(\)Z[ \t]*\n)'
                 r'(.*?)'
@@ -186,24 +189,20 @@ jobs:
             content = read(path)
             if "getInstallerPackageName" not in content:
                 continue
-
             lines = content.split('\n')
             out   = []
             armed = False
-
             for line in lines:
                 stripped = line.strip()
-
                 if 'getInstallerPackageName' in line:
                     armed = True
                     out.append(line)
                     continue
-
                 if armed:
                     if re.match(r'if-eqz\s+', stripped):
                         out.append(f"    # PATCHED-OUT: {stripped}")
                         armed = False
-                        patched.append(f"[INSTALLER] if-eqz removed: {os.path.basename(path)}")
+                        patched.append(f"[INSTALLER] if-eqz: {os.path.basename(path)}")
                         continue
                     elif re.match(r'if-nez\s+', stripped):
                         m = re.search(r'(:cond_\w+)', stripped)
@@ -215,7 +214,7 @@ jobs:
                     elif re.match(r'if-eq\s+', stripped):
                         out.append(f"    # PATCHED-OUT: {stripped}")
                         armed = False
-                        patched.append(f"[INSTALLER] if-eq removed: {os.path.basename(path)}")
+                        patched.append(f"[INSTALLER] if-eq: {os.path.basename(path)}")
                         continue
                     elif re.match(r'if-ne\s+', stripped):
                         m = re.search(r'(:cond_\w+)', stripped)
@@ -226,9 +225,7 @@ jobs:
                             continue
                     elif '.method ' in line:
                         armed = False
-
                 out.append(line)
-
             new_content = '\n'.join(out)
             if new_content != content:
                 write(path, new_content)
@@ -238,11 +235,9 @@ jobs:
             content = read(path)
             if "1.26.5" not in content and "supported version" not in content.lower():
                 continue
-
             lines = content.split('\n')
             out   = []
             in_ver_method = False
-
             for i, line in enumerate(lines):
                 if '.method' in line:
                     lookahead = '\n'.join(lines[i:i+60])
@@ -250,7 +245,6 @@ jobs:
                         in_ver_method = True
                 if '.end method' in line:
                     in_ver_method = False
-
                 if in_ver_method and line.strip() == 'const/4 v0, 0x0':
                     j = i + 1
                     while j < len(lines) and not lines[j].strip():
@@ -259,23 +253,19 @@ jobs:
                         out.append(line.replace('0x0', '0x1'))
                         patched.append(f"[VERSION] flip: {os.path.basename(path)}")
                         continue
-
                 out.append(line)
-
             new_content = '\n'.join(out)
             if new_content != content:
                 write(path, new_content)
 
         # ── PATCH 4: Signature check bypass ───────────────────────────────
         SIG_KW = ["GET_SIGNATURES", "GET_SIGNING_CERTIFICATES"]
-
         for path in smali_files():
             content = read(path)
             if not any(kw in content for kw in SIG_KW):
                 continue
             if "mojang" not in content.lower() and "flarial" not in path.lower():
                 continue
-
             new_content = re.sub(
                 r'(\.method (?:\w+ )*(?:verify\w+|check\w+Sig\w*|validateSig\w*)'
                 r'\([^)]*\)Z[ \t]*\n)'
@@ -289,7 +279,6 @@ jobs:
                 write(path, new_content)
                 patched.append(f"[SIG] stub: {os.path.basename(path)}")
 
-        # ── Summary ───────────────────────────────────────────────────────
         print(f"\n{'='*55}")
         print(f"Scanned : {scanned} smali files")
         print(f"Patches : {len(patched)}")
@@ -303,24 +292,44 @@ jobs:
     - name: Recompile APK
       run: |
         java -jar apktool.jar b flarial_decompiled \
-          -o flarial_patched_unsigned.apk \
+          -o flarial_patched_raw.apk \
           --use-aapt2
-        echo "Recompiled: $(du -sh flarial_patched_unsigned.apk | cut -f1)"
+        echo "Recompiled: $(du -sh flarial_patched_raw.apk | cut -f1)"
 
-    - name: Sign APK
+    - name: Zipalign
       run: |
-        java -jar signer.jar \
-          --apks flarial_patched_unsigned.apk \
-          --out ./ \
-          --allowResign \
-          --overwrite
+        $ZIPALIGN -v -p 4 flarial_patched_raw.apk flarial_patched_aligned.apk
+        echo "Aligned ✓"
 
-        SIGNED=$(ls *aligned-debugSigned.apk 2>/dev/null \
-               || ls *aligned-signed.apk 2>/dev/null \
-               || ls *signed.apk 2>/dev/null | head -1)
+    - name: Generate debug keystore
+      run: |
+        keytool -genkeypair -v \
+          -keystore debug.keystore \
+          -alias androiddebugkey \
+          -keyalg RSA \
+          -keysize 2048 \
+          -validity 10000 \
+          -storepass android \
+          -keypass android \
+          -dname "CN=Android Debug,O=Android,C=US"
+        echo "Keystore generated ✓"
 
-        mv "$SIGNED" "Flarial_FIXED_v1.apk"
-        echo "Done: $(du -sh Flarial_FIXED_v1.apk | cut -f1)"
+    - name: Sign APK with apksigner
+      run: |
+        $APKSIGNER sign \
+          --ks debug.keystore \
+          --ks-key-alias androiddebugkey \
+          --ks-pass pass:android \
+          --key-pass pass:android \
+          --v1-signing-enabled true \
+          --v2-signing-enabled true \
+          --v3-signing-enabled true \
+          --out Flarial_FIXED_v1.apk \
+          flarial_patched_aligned.apk
+
+        # Verify it actually signed
+        $APKSIGNER verify --verbose Flarial_FIXED_v1.apk
+        echo "Signed: $(du -sh Flarial_FIXED_v1.apk | cut -f1)"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
