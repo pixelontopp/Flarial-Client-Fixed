@@ -34,8 +34,6 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        echo "Fetching release v1 from ${{ github.repository }}..."
-
         RELEASE_JSON=$(curl -s \
           -H "Authorization: Bearer $GH_TOKEN" \
           -H "Accept: application/vnd.github+json" \
@@ -55,10 +53,8 @@ jobs:
         DOWNLOAD_URL=$(echo "$RELEASE_JSON" | python3 -c "
         import sys, json
         data = json.load(sys.stdin)
-        assets = data.get('assets', [])
-        # prefer .apks, fallback to .apk
         for ext in ('.apks', '.apk'):
-            for a in assets:
+            for a in data.get('assets', []):
                 if a['name'].endswith(ext):
                     print(a['browser_download_url'])
                     sys.exit(0)
@@ -124,7 +120,6 @@ jobs:
           done
         done
 
-        echo ""
         echo "Total deleted: $DELETED .so files"
 
     - name: Patch smali
@@ -151,8 +146,9 @@ jobs:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(content)
 
-        STUB_FALSE = "\n    const/4 v0, 0x0\n    return v0\n"
-        STUB_TRUE  = "\n    const/4 v0, 0x1\n    return v0\n"
+        # FIX: always inject .registers 1 so smali compiles clean
+        STUB_FALSE = "    .registers 1\n    const/4 v0, 0x0\n    return v0\n"
+        STUB_TRUE  = "    .registers 1\n    const/4 v0, 0x1\n    return v0\n"
 
         # ── PATCH 1: Stub ad ContentProvider onCreate() ───────────────────
         AD_PROVIDERS = [
@@ -171,8 +167,10 @@ jobs:
             is_ad = any(p.lower() in path.lower() for p in AD_PROVIDERS)
             if not is_ad:
                 continue
+
+            # FIX: don't capture .registers in group 1 — always replace it
             new_content = re.sub(
-                r'(\.method public onCreate\(\)Z\s*(?:\.registers \d+\s*)?)'
+                r'(\.method public onCreate\(\)Z[ \t]*\n)'
                 r'(.*?)'
                 r'(?=\.end method)',
                 lambda m: m.group(1) + STUB_FALSE,
@@ -188,15 +186,19 @@ jobs:
             content = read(path)
             if "getInstallerPackageName" not in content:
                 continue
+
             lines = content.split('\n')
             out   = []
             armed = False
+
             for line in lines:
                 stripped = line.strip()
+
                 if 'getInstallerPackageName' in line:
                     armed = True
                     out.append(line)
                     continue
+
                 if armed:
                     if re.match(r'if-eqz\s+', stripped):
                         out.append(f"    # PATCHED-OUT: {stripped}")
@@ -224,7 +226,9 @@ jobs:
                             continue
                     elif '.method ' in line:
                         armed = False
+
                 out.append(line)
+
             new_content = '\n'.join(out)
             if new_content != content:
                 write(path, new_content)
@@ -234,9 +238,11 @@ jobs:
             content = read(path)
             if "1.26.5" not in content and "supported version" not in content.lower():
                 continue
+
             lines = content.split('\n')
             out   = []
             in_ver_method = False
+
             for i, line in enumerate(lines):
                 if '.method' in line:
                     lookahead = '\n'.join(lines[i:i+60])
@@ -244,6 +250,7 @@ jobs:
                         in_ver_method = True
                 if '.end method' in line:
                     in_ver_method = False
+
                 if in_ver_method and line.strip() == 'const/4 v0, 0x0':
                     j = i + 1
                     while j < len(lines) and not lines[j].strip():
@@ -252,22 +259,26 @@ jobs:
                         out.append(line.replace('0x0', '0x1'))
                         patched.append(f"[VERSION] flip: {os.path.basename(path)}")
                         continue
+
                 out.append(line)
+
             new_content = '\n'.join(out)
             if new_content != content:
                 write(path, new_content)
 
         # ── PATCH 4: Signature check bypass ───────────────────────────────
         SIG_KW = ["GET_SIGNATURES", "GET_SIGNING_CERTIFICATES"]
+
         for path in smali_files():
             content = read(path)
             if not any(kw in content for kw in SIG_KW):
                 continue
             if "mojang" not in content.lower() and "flarial" not in path.lower():
                 continue
+
             new_content = re.sub(
                 r'(\.method (?:\w+ )*(?:verify\w+|check\w+Sig\w*|validateSig\w*)'
-                r'\([^)]*\)Z\s*(?:\.registers \d+\s*)?)'
+                r'\([^)]*\)Z[ \t]*\n)'
                 r'(.*?)'
                 r'(?=\.end method)',
                 lambda m: m.group(1) + STUB_TRUE,
@@ -309,7 +320,7 @@ jobs:
                || ls *signed.apk 2>/dev/null | head -1)
 
         mv "$SIGNED" "Flarial_FIXED_v1.apk"
-        echo "Done: Flarial_FIXED_v1.apk ($(du -sh Flarial_FIXED_v1.apk | cut -f1))"
+        echo "Done: $(du -sh Flarial_FIXED_v1.apk | cut -f1)"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
